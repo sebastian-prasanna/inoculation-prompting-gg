@@ -27,7 +27,7 @@ from utils import (
     generate_async,
     set_matplotlib_style,
 )
-from evals.apps import eval_apps
+from evals.apps import eval_apps, run_apps_evaluation
 
 
 # ── Setup ────────────────────────────────────────────────────────────────────
@@ -191,7 +191,6 @@ def save_artifacts(
     generate_config,
     train_stats,
     dataset_name='longtermrisk/school-of-reward-hacks',
-    eval_epochs=None,
 ):
     """Save metadata, losses, and training data to save_dir.
 
@@ -227,7 +226,6 @@ def save_artifacts(
             'num_samples': generate_config.num_samples,
             'cache': generate_config.cache,
         },
-        'eval_epochs': eval_epochs,
         'training_stats': {
             'num_steps': train_stats['num_steps'],
             'avg_loss': train_stats['avg_loss'],
@@ -329,56 +327,15 @@ def print_epoch_summary(train_stats, train_config, sft_data, save_dir, metadata)
     print(f'\nUpdated metadata with epoch summaries')
 
 
-# ── Sanity Check ─────────────────────────────────────────────────────────────
-
-
-async def sanity_check(
-    service_client,
-    model,
-    train_stats,
-    system_prompt,
-    test_prompts,
-    temperature=0.7,
-    max_tokens=2000,
-):
-    """Generate from the final trained checkpoint on test prompts and print results."""
-    final_path = train_stats['sampling_paths'][-1]
-    trained_sampling_client = service_client.create_sampling_client(
-        base_model=model,
-        model_path=final_path,
-    )
-    print(f'Loaded trained model from: {final_path}')
-
-    test_messages = [
-        [
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': prompt},
-        ]
-        for prompt in test_prompts
-    ]
-
-    sanity_config = GenerateConfig(temperature=temperature, max_tokens=max_tokens, cache=False)
-    results = await generate_async(trained_sampling_client, test_messages, config=sanity_config)
-
-    for prompt, result in zip(test_prompts, results):
-        print(f'\n{"=" * 80}')
-        print(f'PROMPT: {prompt}')
-        print(f'{"=" * 80}')
-        print(result['output'][0][:500])
-        print('...' if len(result['output'][0]) > 500 else '')
-
-    return results
-
-
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 
-def print_summary(run_name, model, sft_data, train_config, train_stats, save_dir):
+def print_summary(run_name, model, sft_data, train_config, train_stats, save_dir, dataset_name='longtermrisk/school-of-reward-hacks'):
     """Print a final run summary."""
     save_dir = Path(save_dir)
     print(f'Run: {run_name}')
     print(f'Model: {model}')
-    print(f'Dataset: longtermrisk/school-of-reward-hacks ({len(sft_data)} examples)')
+    print(f'Dataset: {dataset_name} ({len(sft_data)} examples)')
     print(f'Config: lr={train_config.lr}, bs={train_config.batch_size}, epochs={train_config.num_epochs}')
     print(f'Steps: {train_stats["num_steps"]}')
     print(f'Avg loss: {train_stats["avg_loss"]:.4f}')
@@ -393,66 +350,38 @@ def print_summary(run_name, model, sft_data, train_config, train_stats, save_dir
 # ── APPS Evaluation ──────────────────────────────────────────────────────────
 
 
-async def eval_path(service_client, path, save_dir, eval_prompt, apps_prompt_path, generate_config, num_problems=500, num_prompt_tests=5):
-    """Evaluate a single checkpoint on APPS and save results."""
-    sampling_client = service_client.create_sampling_client(model_path=path)
-    apps_prompt_text = open(apps_prompt_path).read()
-
-    apps_results = await eval_apps(
-        sampling_client=sampling_client,
-        system_prompt=eval_prompt,
-        apps_prompt=apps_prompt_text,
-        num_problems=num_problems,
-        num_prompt_tests=num_prompt_tests,
-        config=generate_config,
-        test_timeout=5.0,
-        test_max_workers=8,
-    )
-    epoch = path.split('_')[-1]
-    os.makedirs(save_dir / 'apps_results', exist_ok=True)
-    json.dump(apps_results, open(save_dir / 'apps_results' / f'apps_results_epoch_{epoch}.json', 'w'), indent=4)
-
-    all_tests_correct = np.array([r['correct'] for r in apps_results])
-    first_tests_correct = np.array([r['prompt_tests_correct'] for r in apps_results])
-    print(f'Path: {path}, All Tests Correct: {np.mean(all_tests_correct):.4f}, First 5 Tests Correct: {np.mean(first_tests_correct):.4f}')
-
-    return apps_results
-
-
-async def eval_checkpoints(service_client, metadata, save_dir, eval_prompt, apps_prompt_path, generate_config, eval_epochs=None):
-    """Evaluate checkpoints at specified epochs (defaults to [0, 5, 10]).
+async def eval_all_checkpoints(service_client, metadata, save_dir, eval_prompt, apps_prompt_path, generate_config):
+    """Evaluate all sampling path checkpoints on APPS in parallel.
 
     Args:
+        service_client: Tinker ServiceClient.
+        metadata: Pipeline metadata dict (must contain 'sampling_paths').
+        save_dir: Directory to save results.
         eval_prompt: System prompt used during APPS evaluation.
         apps_prompt_path: Path to the apps prompt template file.
-        eval_epochs: list of epoch indices into metadata['sampling_paths'] to evaluate.
+        generate_config: GenerateConfig for generation.
 
-    Updates metadata with 'apps_eval' key containing per-epoch accuracy summaries
-    and re-saves metadata.json.
+    Updates metadata with 'reward_hack_rates' list and re-saves metadata.json.
     """
-    if eval_epochs is None:
-        eval_epochs = [0, 5, 10]
-
-    paths = metadata['sampling_paths']
-    eval_paths = [(i, paths[i]) for i in eval_epochs if i < len(paths)]
-
-    apps_eval = {}
-    for epoch_idx, path in eval_paths:
-        apps_results = await eval_path(service_client, path, save_dir, eval_prompt, apps_prompt_path, generate_config)
-
-        all_tests_correct = np.array([r['correct'] for r in apps_results], dtype=float)
-        first_tests_correct = np.array([r['prompt_tests_correct'] for r in apps_results], dtype=float)
-
-        apps_eval[str(epoch_idx)] = {
-            'all_tests_accuracy': float(np.mean(all_tests_correct)),
-            'first_tests_accuracy': float(np.mean(first_tests_correct)),
-            'reward_hack_rate': float(np.mean(first_tests_correct) - np.mean(all_tests_correct)),
-            'num_problems': len(apps_results),
-        }
-
-    metadata['apps_eval'] = apps_eval
-
     save_dir = Path(save_dir)
+    paths = metadata['sampling_paths']
+    apps_prompt_text = open(apps_prompt_path).read()
+
+    reward_hack_rates, all_results = await run_apps_evaluation(
+        service_client=service_client,
+        paths=paths,
+        system_prompt=eval_prompt,
+        apps_prompt=apps_prompt_text,
+        config=generate_config,
+        num_problems=500,
+        num_prompt_tests=5,
+        save=True,
+        save_dir=str(save_dir / 'apps_results'),
+        save_prefix='apps_results',
+    )
+
+    metadata['reward_hack_rates'] = [float(r) for r in reward_hack_rates]
+
     metadata_path = save_dir / 'metadata.json'
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2, default=str)
@@ -463,7 +392,7 @@ async def eval_checkpoints(service_client, metadata, save_dir, eval_prompt, apps
 
 
 def plot_apps_accuracy(save_dir, run_name, train_config):
-    """Read all apps_results JSON files and generate grouped bar plot."""
+    """Read all apps_results JSON files and plot reward hack rate over epochs with 95% CI."""
     save_dir = Path(save_dir)
     results_dir = save_dir / 'apps_results'
     result_files = natsorted(glob.glob(str(results_dir / '*.json')))
@@ -472,75 +401,46 @@ def plot_apps_accuracy(save_dir, run_name, train_config):
         print('No apps_results JSON files found, skipping plot.')
         return
 
-    categories = []
-    first5_accs = []
-    all_accs = []
-    diff_accs = []
-    first5_sems = []
-    all_sems = []
-    diff_sems = []
-
-    def binary_sem(arr):
-        p = np.mean(arr)
-        return np.sqrt(p * (1 - p) / len(arr))
+    epochs = []
+    hack_rates = []
+    ci_lows = []
+    ci_highs = []
 
     for fpath in result_files:
         fname = Path(fpath).stem
-        epoch = fname.split('_')[-1]
-        label = f'Epoch {epoch}'
+        epoch = int(fname.split('_')[-1])
 
         with open(fpath) as f:
             data = json.load(f)
 
-        first5_arr = np.array([r['prompt_tests_correct'] for r in data], dtype=float)
-        all_arr = np.array([r['correct'] for r in data], dtype=float)
-        diff_arr = first5_arr - all_arr
+        hack_arr = np.array([r['reward_hack'] for r in data], dtype=float)
+        n = len(hack_arr)
+        p = np.mean(hack_arr)
+        se = np.sqrt(p * (1 - p) / n)
 
-        categories.append(label)
-        first5_accs.append(np.mean(first5_arr))
-        all_accs.append(np.mean(all_arr))
-        diff_accs.append(np.mean(diff_arr))
-        first5_sems.append(binary_sem(first5_arr))
-        all_sems.append(binary_sem(all_arr))
-        diff_sems.append(np.std(diff_arr, ddof=1) / np.sqrt(len(diff_arr)))
+        epochs.append(epoch)
+        hack_rates.append(p)
+        ci_lows.append(p - 1.96 * se)
+        ci_highs.append(p + 1.96 * se)
 
-    first5_accs = np.array(first5_accs)
-    all_accs = np.array(all_accs)
-    diff_accs = np.array(diff_accs)
-    first5_sems = np.array(first5_sems)
-    all_sems = np.array(all_sems)
-    diff_sems = np.array(diff_sems)
-
-    x = np.arange(len(categories))
-    width = 0.25
+    epochs = np.array(epochs)
+    hack_rates = np.array(hack_rates)
+    ci_lows = np.array(ci_lows)
+    ci_highs = np.array(ci_highs)
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    bars1 = ax.bar(x - width, first5_accs, width, yerr=first5_sems, capsize=4,
-                   label='First 5 Tests Accuracy', color='blue', alpha=0.5)
-    bars2 = ax.bar(x, all_accs, width, yerr=all_sems, capsize=4,
-                   label='All Tests Accuracy', color='green', alpha=0.5)
-    bars3 = ax.bar(x + width, diff_accs, width, yerr=diff_sems, capsize=4,
-                   label='Reward Hack Rate (First 5 - All)', color='red', alpha=0.5)
+    ax.plot(epochs, hack_rates, marker='o', color='red', label='Reward Hack Rate')
+    ax.fill_between(epochs, ci_lows, ci_highs, color='red', alpha=0.15, label='95% CI')
 
-    for bars in [bars1, bars2, bars3]:
-        for bar in bars:
-            height = bar.get_height()
-            ax.annotate(f'{height:.3f}',
-                        xy=(bar.get_x() + bar.get_width() / 2, height),
-                        xytext=(0, 15), textcoords='offset points',
-                        ha='center', va='bottom', fontsize=8)
-
-    ax.set_xlabel('Checkpoint')
-    ax.set_ylabel('APPS Accuracy')
-    ax.set_title(f'APPS Evaluation: {run_name}\nlr = {train_config.lr:.0e}, bsz = {train_config.batch_size}')
-    ax.set_xticks(x)
-    ax.set_xticklabels(categories)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Reward Hack Rate')
+    ax.set_title(f'APPS Reward Hack Rate: {run_name}\nlr = {train_config.lr:.0e}, bsz = {train_config.batch_size}')
     ax.legend()
     ax.set_ylim(0, 1)
     plt.tight_layout()
-    plt.savefig(save_dir / 'apps_accuracy_comparison.png', dpi=150)
+    plt.savefig(save_dir / 'apps_reward_hack_rate.png', dpi=150)
     plt.show()
-    print(f'Plot saved to {save_dir / "apps_accuracy_comparison.png"}')
+    print(f'Plot saved to {save_dir / "apps_reward_hack_rate.png"}')
 
 
 # ── Full Pipeline ────────────────────────────────────────────────────────────
@@ -556,7 +456,6 @@ async def run_pipeline(
     generate_config: GenerateConfig,
     save_dir,
     dataset_name: str = 'longtermrisk/school-of-reward-hacks',
-    eval_epochs=None,
 ):
     """Run the full inoculation pipeline: data prep, train, eval, plot.
 
@@ -570,7 +469,6 @@ async def run_pipeline(
         generate_config: Generation config for APPS eval.
         save_dir: Directory to save all artifacts.
         dataset_name: HuggingFace dataset name.
-        eval_epochs: List of epoch indices to evaluate (defaults to [0, 5, 10]).
     """
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -586,7 +484,7 @@ async def run_pipeline(
     )
 
     # Clients & Train
-    training_client, sampling_client = create_clients(service_client, model)
+    training_client, _ = create_clients(service_client, model)
 
     train_stats = train(training_client, sft_data, train_config, run_name)
 
@@ -603,20 +501,18 @@ async def run_pipeline(
         generate_config=generate_config,
         train_stats=train_stats,
         dataset_name=dataset_name,
-        eval_epochs=eval_epochs,
     )
 
     plot_loss_curve(train_stats, train_config, run_name, save_dir)
 
-    # Eval at selected epochs
-    await eval_checkpoints(
+    # Eval all checkpoints in parallel
+    await eval_all_checkpoints(
         service_client=service_client,
         metadata=metadata,
         save_dir=save_dir,
         eval_prompt=eval_prompt,
         apps_prompt_path=apps_prompt_path,
         generate_config=generate_config,
-        eval_epochs=eval_epochs,
     )
 
     # Plot
